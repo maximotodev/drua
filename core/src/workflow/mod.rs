@@ -1457,13 +1457,20 @@ impl Workflows {
             .build()
             .map_err(|e| WorkflowError::BuildEntity(e.to_string()))?;
 
-        let run = run_repo.create(new).await?;
+        let mut op = run_repo.begin_op().await?;
+        let run = run_repo.create_in_op(&mut op, new).await?;
 
         let queue_id = format!("workflow:{}", definition.id);
         execute_run_spawner
-            .spawn_with_queue_id(run.id, ExecuteRunConfig { run_id: run.id }, &queue_id)
+            .spawn_with_queue_id_in_op(
+                &mut op,
+                run.id,
+                ExecuteRunConfig { run_id: run.id },
+                &queue_id,
+            )
             .await
             .map_err(|e| WorkflowError::Job(e.to_string()))?;
+        op.commit().await?;
 
         Ok(Some(run))
     }

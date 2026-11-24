@@ -733,6 +733,60 @@ async fn workflow_trigger_mutation_returns_run_or_filtered() {
         .await
         .expect("create filtered workflow");
 
+    // Reject only this workflow's queue in the disposable integration database.
+    // The execution insert runs in a pre-commit hook in job 0.13.2.
+    let queue_id = format!("workflow:{}", runnable.id);
+    let constraint = format!("test_d01_reject_{}", uuid::Uuid::new_v4().simple());
+    sqlx::query(&format!(
+        "ALTER TABLE job_executions ADD CONSTRAINT {constraint} \
+         CHECK (queue_id IS DISTINCT FROM '{queue_id}') NOT VALID"
+    ))
+    .execute(&pool)
+    .await
+    .expect("install scoped scheduling failure");
+
+    let rejected = app
+        .workflows()
+        .trigger_run(&sub, runnable.id, serde_json::json!({}))
+        .await;
+
+    sqlx::query(&format!(
+        "ALTER TABLE job_executions DROP CONSTRAINT {constraint}"
+    ))
+    .execute(&pool)
+    .await
+    .expect("remove scoped scheduling failure");
+
+    let Err(error) = rejected else {
+        panic!("expected scheduling failure");
+    };
+    assert!(
+        error.to_string().contains(&constraint),
+        "expected injected constraint violation, got {error}"
+    );
+    let run_count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM workflow_runs WHERE definition_id = $1")
+            .bind(runnable.id)
+            .fetch_one(&pool)
+            .await
+            .expect("count rejected runs");
+    assert_eq!(run_count, 0, "failed scheduling must not leave a run");
+    let event_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM workflow_run_events WHERE event->>'definition_id' = $1",
+    )
+    .bind(runnable.id.to_string())
+    .fetch_one(&pool)
+    .await
+    .expect("count rejected run events");
+    assert_eq!(event_count, 0, "failed scheduling must not leave run events");
+    let queued_count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM job_executions WHERE queue_id = $1")
+            .bind(&queue_id)
+            .fetch_one(&pool)
+            .await
+            .expect("count rejected executions");
+    assert_eq!(queued_count, 0);
+
     let result = execute_graphql(
         &schema,
         &app,
@@ -761,6 +815,20 @@ async fn workflow_trigger_mutation_returns_run_or_filtered() {
         data["workflowTrigger"]["run"]["triggerContext"]["source"],
         "graphql-test"
     );
+    let run_id = uuid::Uuid::parse_str(
+        data["workflowTrigger"]["run"]["id"]
+            .as_str()
+            .expect("run id"),
+    )
+    .expect("valid run id");
+    let job_count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM jobs WHERE id = $1 AND job_type = $2")
+            .bind(run_id)
+            .bind("workflow.execute-run")
+            .fetch_one(&pool)
+            .await
+            .expect("count scheduled jobs");
+    assert_eq!(job_count, 1, "successful trigger must persist its job");
 
     let result = execute_graphql(
         &schema,
@@ -775,6 +843,13 @@ async fn workflow_trigger_mutation_returns_run_or_filtered() {
     let data = assert_no_errors(&result);
     assert_eq!(data["workflowTrigger"]["filtered"], true);
     assert!(data["workflowTrigger"]["run"].is_null());
+    let filtered_count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM workflow_runs WHERE definition_id = $1")
+            .bind(filtered.id)
+            .fetch_one(&pool)
+            .await
+            .expect("count filtered runs");
+    assert_eq!(filtered_count, 0);
 }
 
 // ─── Library search query tests ────────────────────────────────────────────
